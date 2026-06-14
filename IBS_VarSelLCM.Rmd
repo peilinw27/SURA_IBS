@@ -1,0 +1,118 @@
+---
+title: "IBS"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE,
+	autodep = TRUE,
+	cache = TRUE,
+	cache.comments = FALSE,
+	tidy = TRUE,
+	tidy.opts = list(comment = FALSE)
+)
+
+library(knitr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+library(cluster)
+library(VarSelLCM)
+library(pheatmap)
+library(tibble)
+```
+
+```{r}
+ema_0 <- read.csv("../EMA_B1_SURA.csv")
+wide_assign <- read.csv("../wide_assign.csv")
+```
+
+```{r data_cleaning}
+cat_vars <- c("Gender_Final", "Substance_use", "Stress_tech",
+              "Sex", "Race", "IBS_type", "Colectomy", "Descent",
+              "Marital_status", "Education", "Income_self", "Health_issues")
+
+wide_assign.cleaned <- wide_assign %>%
+  dplyr::select(-Condition, -SSS_Sum_T2_Recode, 
+                -SSS_Sum_T3_Recode, -TE_Credibility_T1, -TE_Expectancy_T1) %>%
+  na.omit() %>% 
+  dplyr::mutate(
+    across(all_of(cat_vars), factor)
+  )
+
+input_wide <- wide_assign.cleaned %>%
+  dplyr::select(-PID)
+
+ema <- ema_0 %>% 
+  group_by(PID) %>%
+  filter(n() >= 11) %>%
+  ungroup() %>%
+  dplyr::select(-time, -Timeofday_f, -Weekday_Weekend)
+
+avg_ema <- ema %>%
+  group_by(PID) %>% 
+  summarize(
+    across(where(is.numeric), ~mean(.x, na.rm = TRUE)), 
+    across(where(is.character), ~first(.x))
+  )
+
+merged_data <- wide_assign.cleaned %>% 
+  inner_join(avg_ema, by = "PID")
+
+input_merged <- merged_data %>%
+  dplyr::select(-PID)
+
+
+num_vars.wide <- setdiff(names(input_wide), cat_vars)
+wide_scaled <- input_wide
+wide_scaled[num_vars.wide] <- scale(input_wide[num_vars.wide])
+
+num_vars.merged <- setdiff(names(input_merged), cat_vars)
+merge_scaled <- input_merged
+merge_scaled[num_vars.merged] <- scale(input_merged[num_vars.merged])
+```
+
+
+```{r helper_functions}
+run_lcm <- function(data, name) {
+  model <- VarSelCluster(x = data, gvals = 1:10)
+  
+  rel_vars <- model@model@names.relevant
+  clusters <- model@partitions@zMAP
+  
+  clustered_data <- data %>%
+    mutate(cluster = factor(clusters))
+  
+  rel_vars_num <- rel_vars[sapply(clustered_data[rel_vars], is.numeric)]
+  
+  profiles <- clustered_data %>%
+    group_by(cluster) %>%
+    summarise(
+      across(all_of(rel_vars_num), ~mean(.x, na.rm = TRUE))
+    )
+  
+  mat <- profiles %>%
+    column_to_rownames("cluster") %>%
+    as.matrix()
+  
+  pheatmap(t(mat), 
+           cluster_rows = TRUE, 
+           cluster_cols = TRUE, 
+           main = paste("IBS Phynotype for Normalized", name, "data"))
+  
+  return(model)
+}
+```
+
+```{r}
+run_lcm(wide_scaled, "wide_assign")
+```
+
+```{r}
+run_lcm(merge_scaled, "wide_assign + ema")
+```
+
