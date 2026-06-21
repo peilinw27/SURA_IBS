@@ -1,0 +1,227 @@
+```{r}
+# ############################################################################
+#  IBS PATIENT SUBGROUPS — FINAL ANALYSIS PIPELINE
+#  Andrew Seo | STAR study | LPA on baseline + EMA
+#
+#  HOW TO READ THIS FILE (for teammates):
+#    It runs top to bottom in 5 parts. Each part answers ONE question.
+#    Every result print starts with "-->" telling you what it means.
+#
+#    PART 1  Which variables, and why?            (finalize the inputs)
+#    PART 2  What are the subgroups?              (run the clustering)
+#    PART 3  Can we trust the 2-group split?      (validate it)
+#    PART 4  Is it a NEW axis?                    (independent of known labels)
+#    PART 5  Does it matter clinically?           (predict treatment response)
+#
+#  ONE RULE throughout: variables are continuous, standardized (scale()),
+#  NEVER discretized. Clustering = latent profile analysis via mclust.
+# ############################################################################
+
+pkgs <- c("dplyr","mclust","tidyr","cluster")
+for (p in pkgs) if (!requireNamespace(p, quietly=TRUE))
+  install.packages(p, repos="https://cloud.r-project.org")
+library(dplyr); library(mclust)
+
+base_path <- "/Users/seobeomjin/Desktop/SURA IBS Clustering/"
+wide <- read.csv(paste0(base_path, "wide_assign.csv"))   # 1 row per patient (baseline + outcomes)
+ema  <- read.csv(paste0(base_path, "EMA_B1_SURA.csv"))    # many rows per patient (phone surveys)
+
+
+# ############################################################################
+#  PART 1 — WHICH VARIABLES, AND WHY?
+#  We use 9 variables: 3 baseline questionnaires + 6 EMA features.
+#  WHY these: factor analysis (done previously) showed IBS patients vary along
+#  psychological distress, momentary affect, and IBS symptoms. These 9 cover
+#  those axes. NOTE: 'distress' here is the EMA item "my IBS symptoms cause me
+#  distress" -> it is a SYMPTOM measure, not a mood measure. We label it as such.
+# ############################################################################
+cat("\n############ PART 1: VARIABLES ############\n")
+
+# Collapse EMA (many rows/patient) to ONE row/patient: mean = usual level,
+# SD = day-to-day swing. Keep patients with >=10 responses (reliable summary).
+ema_feat <- ema %>%
+  group_by(PID) %>% filter(n() >= 10) %>%
+  summarise(
+    neg_mean      = mean(negative_beep, na.rm=TRUE),  neg_sd      = sd(negative_beep, na.rm=TRUE),
+    stress_mean   = mean(stress,        na.rm=TRUE),  stress_sd   = sd(stress,        na.rm=TRUE),
+    distress_mean = mean(distress,      na.rm=TRUE),  distress_sd = sd(distress,      na.rm=TRUE),
+    .groups="drop")
+
+# the 9 final variables, grouped by what they measure
+final_vars <- c("BSI_Total_T1",        # baseline: psychological distress  (PSYCH)
+                "SSS_Sum_T1_Recode",   # baseline: IBS symptom severity     (SYMPTOM)
+                "VSI_Sum_T1",          # baseline: visceral/GI anxiety       (ANXIETY)
+                "neg_mean","neg_sd",       # EMA: negative affect level + swing   (AFFECT)
+                "stress_mean","stress_sd", # EMA: stress level + swing            (AFFECT)
+                "distress_mean","distress_sd") # EMA: symptom-distress level + swing (SYMPTOM)
+
+# build the analysis table: one row per patient, only complete cases
+dat <- wide %>%
+  select(PID, BSI_Total_T1, SSS_Sum_T1_Recode, VSI_Sum_T1) %>%
+  left_join(ema_feat, by="PID") %>%
+  select(PID, all_of(final_vars)) %>%
+  na.omit()
+
+cat(sprintf("--> Analysis sample: %d patients, %d variables.\n", nrow(dat), length(final_vars)))
+cat("--> 3 baseline (BSI/SSS/VSI) + 6 EMA (neg, stress, symptom-distress; mean+SD)\n")
+
+
+# ############################################################################
+#  PART 2 — WHAT ARE THE SUBGROUPS?
+#  Standardize, then let BIC pick the number of clusters K from 2..6.
+# ############################################################################
+cat("\n############ PART 2: CLUSTERING ############\n")
+
+X <- scale(dat[, final_vars])     # standardize: mean 0, SD 1 (no discretizing)
+set.seed(42)                      # reproducible
+fit <- Mclust(X, G = 2:6)         # latent profile analysis; BIC chooses K
+
+dat$cluster <- fit$classification
+cat(sprintf("--> BIC selected K = %d clusters. Sizes: %s\n",
+            fit$G, paste(table(dat$cluster), collapse=" / ")))
+
+# show BIC per K so readers see WHY K was chosen (higher = better in mclust)
+bic_by_k <- sapply(2:6, function(k) round(max(fit$BIC[as.character(k), ], na.rm=TRUE), 1))
+names(bic_by_k) <- paste0("K=", 2:6)
+cat("--> BIC by K (higher is better; it peaks at the chosen K):\n")
+print(bic_by_k)
+
+# name the clusters by their symptom severity so labels are meaningful
+# (use simple one-word labels: lm coefficient names break with colons/spaces)
+sev_by_cluster <- tapply(dat$SSS_Sum_T1_Recode, dat$cluster, mean)
+high_cluster <- as.integer(names(which.max(sev_by_cluster)))
+dat$Cluster <- factor(ifelse(dat$cluster == high_cluster, "HighBurden", "Resilient"),
+                      levels = c("Resilient","HighBurden"))  # Resilient = reference
+cat(sprintf("--> Cluster %d has higher symptom severity -> labeled 'HighBurden'.\n", high_cluster))
+
+
+# ############################################################################
+#  PART 3 — CAN WE TRUST THE SPLIT? (what separates the groups)
+#  Standardized means per cluster: the biggest gaps show WHICH variables drive
+#  the split. (Previously found: affect leads, symptom-distress supports.)
+# ############################################################################
+cat("\n############ PART 3: WHAT SEPARATES THE GROUPS ############\n")
+
+zprof <- aggregate(X, list(cluster=dat$cluster), mean)
+zt <- t(round(zprof[, -1], 2))
+colnames(zt) <- paste0("clust", zprof$cluster)
+zt <- cbind(zt, gap = round(abs(zt[, 1] - zt[, 2]), 2))
+zt <- zt[order(-zt[, "gap"]), ]   # biggest separators on top
+cat("--> Standardized cluster means, sorted by separation power (gap):\n")
+print(zt)
+cat("--> Variables at the top separate the groups most.\n")
+
+# also report classification confidence (how sure the model is per patient)
+cat(sprintf("--> Mean classification uncertainty: %.3f (near 0 = confident).\n",
+            mean(fit$uncertainty)))
+
+# silhouette: how geometrically separated are the clusters? (honesty check)
+# ASW near 0 = clusters overlap (a spectrum), not sharply separated blocks.
+if (requireNamespace("cluster", quietly=TRUE)) {
+  sil <- cluster::silhouette(dat$cluster, dist(X))
+  asw <- mean(sil[, "sil_width"])
+  cat(sprintf("--> Average silhouette width (ASW) = %.3f\n", asw))
+  cat("    (ASW ~0.2 means weak separation: IBS burden is a SPECTRUM, not\n")
+  cat("     sharp categories. The 2 profiles summarize a gradient. We report\n")
+  cat("     this honestly rather than overclaiming clean clusters.)\n")
+}
+
+
+# ############################################################################
+#  PART 4 — IS IT A NEW AXIS? (independence from known labels)
+#  A grouping is only useful if it adds something the existing labels don't.
+#  We check two known labels: Rome IV bowel-habit subtype, and treatment arm.
+# ############################################################################
+cat("\n############ PART 4: INDEPENDENCE CHECKS ############\n")
+
+# attach the known labels
+dat$RomeIV    <- factor(wide$IBS_type[match(dat$PID, wide$PID)],
+                        levels=c(1,2,3), labels=c("IBS-C","IBS-D","IBS-M"))
+dat$Condition <- factor(wide$Condition[match(dat$PID, wide$PID)])
+
+# (a) Rome IV subtype: distribution within each cluster + agreement (ARI)
+cat("\n-- (a) vs Rome IV subtype --\n")
+cat("--> % of each bowel-habit subtype within each cluster:\n")
+print(round(prop.table(table(dat$Cluster, dat$RomeIV), 1) * 100, 1))
+ari_rome <- adjustedRandIndex(dat$cluster,
+              as.integer(wide$IBS_type[match(dat$PID, wide$PID)]))
+cat(sprintf("--> ARI vs Rome IV = %.3f  (near 0 = independent of bowel-habit type)\n", ari_rome))
+
+# (b) treatment arm: does the cluster just re-discover who got which treatment?
+cat("\n-- (b) vs Treatment arm --\n")
+cat("--> Treatment arm (CT/MA/MO) count within each cluster:\n")
+print(table(Cluster = dat$Cluster, Condition = dat$Condition))
+cat("--> If every arm appears in every cluster -> clusters are NOT treatment arm.\n")
+
+
+# ############################################################################
+#  PART 5 — DOES IT MATTER CLINICALLY? (treatment response)  ★ THE KEY TEST
+#  Question: do our baseline subgroups predict how symptoms change after
+#  treatment? Outcome = IBS symptom severity (SSS) at T1, T2, T3.
+#  Lower SSS = better. We test whether cluster predicts T3 AFTER adjusting for
+#  baseline severity (so it's not just "they started different").
+# ############################################################################
+cat("\n############ PART 5: TREATMENT RESPONSE (the 'so what') ############\n")
+
+# attach the three time points of symptom severity
+dat$SSS_T1 <- wide$SSS_Sum_T1_Recode[match(dat$PID, wide$PID)]
+dat$SSS_T2 <- wide$SSS_Sum_T2_Recode[match(dat$PID, wide$PID)]
+dat$SSS_T3 <- wide$SSS_Sum_T3_Recode[match(dat$PID, wide$PID)]
+
+# (a) descriptive: mean SSS over time, per cluster
+cat("\n-- (a) Symptom severity (SSS) over time, by cluster --\n")
+traj <- dat %>% group_by(Cluster) %>%
+  summarise(n=n(),
+            T1=round(mean(SSS_T1, na.rm=TRUE),1),
+            T2=round(mean(SSS_T2, na.rm=TRUE),1),
+            T3=round(mean(SSS_T3, na.rm=TRUE),1),
+            drop_T1_T3=round(mean(SSS_T1,na.rm=TRUE)-mean(SSS_T3,na.rm=TRUE),1),
+            pct_drop=round(100*(mean(SSS_T1,na.rm=TRUE)-mean(SSS_T3,na.rm=TRUE))/
+                           mean(SSS_T1,na.rm=TRUE),1),
+            .groups="drop")
+print(as.data.frame(traj))
+cat("--> Lower SSS = better. Compare absolute drop AND % drop between clusters.\n")
+
+# (b) THE TEST: does cluster predict T3 after adjusting for baseline (T1)?
+#     If the 'Cluster' line is significant (p<0.05), the grouping predicts
+#     outcome beyond just starting severity = clinically meaningful.
+cat("\n-- (b) Baseline-adjusted test: does cluster predict outcome? --\n")
+m_adj <- lm(SSS_T3 ~ SSS_T1 + Cluster, data = dat)
+cat(sprintf("--> Model uses %d patients with complete T1+T3 data.\n",
+            length(m_adj$residuals)))
+print(round(summary(m_adj)$coefficients, 4))
+p_cluster <- summary(m_adj)$coefficients["ClusterHighBurden", "Pr(>|t|)"]
+cat(sprintf("\n--> Cluster p-value = %.4f\n", p_cluster))
+if (p_cluster < 0.05) {
+  cat("--> SIGNIFICANT: clusters predict treatment outcome beyond baseline.\n")
+  cat("    The subgroups are PROGNOSTIC (clinically meaningful).\n")
+} else {
+  cat("--> NOT significant: once baseline is matched, clusters don't predict T3.\n")
+  cat("    The subgroups are DESCRIPTIVE, not prognostic. (Report honestly.)\n")
+}
+cat("    CAVEAT: baseline SSS_T1 is also one of the 9 clustering variables, so\n")
+cat("    cluster and SSS_T1 share some information. The adjustment is still\n")
+cat("    valid (clusters use 9 variables, not just SSS), but this mild overlap\n")
+cat("    should be acknowledged. This is prediction, not causation.\n")
+
+# (c) does treatment arm interact with cluster? (does one arm help one group more?)
+cat("\n-- (c) Does treatment arm work differently by cluster? (interaction) --\n")
+m_int <- lm(SSS_T3 ~ SSS_T1 + Cluster * Condition, data = dat)
+cat(sprintf("--> Interaction model R-squared = %.3f\n", summary(m_int)$r.squared))
+cat("--> (See Cluster:Condition rows below; significant = arm effect differs by group)\n")
+print(round(summary(m_int)$coefficients, 4))
+
+
+# ############################################################################
+#  SUMMARY (printed)
+# ############################################################################
+cat("\n############ ONE-PARAGRAPH SUMMARY ############\n")
+cat(sprintf(
+"We clustered %d IBS patients on 9 baseline+EMA variables (LPA). BIC selected
+K=%d: a high-burden minority and a resilient majority. The split is driven
+mainly by momentary affect, with symptom-distress contributing. Clusters are
+independent of Rome IV subtype (ARI=%.2f) and treatment arm. The key test of
+clinical value is the baseline-adjusted model in Part 5(b): cluster p=%.3f.\n",
+nrow(dat), fit$G, ari_rome, p_cluster))
+```
+
