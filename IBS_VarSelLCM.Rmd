@@ -19,6 +19,7 @@ library(knitr)
 library(dplyr)
 library(tidyr)
 library(stringr)
+library(ggplot2)
 
 library(cluster)
 library(VarSelLCM)
@@ -29,8 +30,8 @@ library(clusterSim)
 ```
 
 ```{r}
-ema_0 <- read.csv("~/Desktop/clustering-SURA Project/EMA_B1_SURA.csv")
-wide_assign <- read.csv("~/Desktop/clustering-SURA Project/wide_assign.csv")
+ema_0 <- read.csv("../EMA_B1_SURA.csv")
+wide_assign <- read.csv("../wide_assign.csv")
 ```
 
 ```{r data_cleaning}
@@ -58,8 +59,13 @@ ema <- ema_0 %>%
 avg_ema <- ema %>%
   group_by(PID) %>% 
   summarize(
-    across(where(is.numeric), ~mean(.x, na.rm = TRUE)), 
-    across(where(is.character), ~first(.x))
+    across(where(is.numeric), list(
+      mean = ~mean(.x, na.rm = TRUE),
+      sd   = ~sd(.x, na.rm = TRUE)
+    ), .names = "{.col}_{.fn}"),
+    
+    across(where(is.character), ~first(.x)),
+    .groups = "drop"
   )
 
 merged_data <- wide_assign.cleaned %>% 
@@ -78,10 +84,9 @@ merge_scaled <- input_merged
 merge_scaled[num_vars.merged] <- scale(input_merged[num_vars.merged])
 ```
 
-
 ```{r helper_functions}
 run_lcm <- function(data, name) {
-  model <- VarSelCluster(x = data, gvals = 1:10)
+  model <- VarSelCluster(x = data, gvals = 1:6)
   
   rel_vars <- model@model@names.relevant
   clusters <- model@partitions@zMAP
@@ -89,7 +94,10 @@ run_lcm <- function(data, name) {
   clustered_data <- data %>%
     mutate(cluster = factor(clusters))
   
-  rel_vars_num <- rel_vars[sapply(clustered_data[rel_vars], is.numeric)]
+  rel_vars_num <- intersect(
+    rel_vars,
+    names(clustered_data)[sapply(clustered_data, is.numeric)]
+  )
   
   profiles <- clustered_data %>%
     group_by(cluster) %>%
@@ -106,57 +114,171 @@ run_lcm <- function(data, name) {
            cluster_cols = TRUE, 
            main = paste("IBS Phynotype for Normalized", name, "data"))
   
-  return(model)
+  return (list(
+    model = model,
+    rel_vars = rel_vars,
+    clusters = clusters,
+    clustered_data = clustered_data,
+    profiles = profiles
+  ))
+}
+
+dist_across_clusters <- function(model) {
+  clustered_data <- model$clustered_data
+  ibs_dist <- clustered_data %>%
+    group_by(cluster, IBS_type) %>%
+    summarise(
+      n = n(),
+      .groups = "drop"
+    ) %>%
+    group_by(cluster) %>%
+    mutate(
+      proportion = n / sum(n)
+    )
+  
+  ggplot(ibs_dist,
+    aes(
+      x = cluster,
+      y = proportion,
+      fill = IBS_type
+    )
+  ) +
+    geom_bar(
+      stat = "identity",
+      position = "dodge"
+    ) +
+    labs(
+      title = "IBS Type Distribution Across VarSelCluster Clusters",
+      x = "Cluster",
+      y = "Proportion"
+    ) +
+    theme_minimal()
+}
+
+ibs_types_dist <- function(input_dat, model) {
+  merged_cluster <- input_dat %>%
+    mutate(
+      cluster = factor(model$clusters),
+      IBS_type = factor(
+        IBS_type,
+        levels = c(1, 2, 3),
+        labels = c("IBS-C", "IBS-D", "IBS-M")
+      )
+    )
+  d <- list(merged_cluster$cluster, merged_cluster$IBS_type)
+  
+    cluster_vars_num <- model$rel_vars[
+      sapply(merged_cluster[model$rel_vars], is.numeric)
+    ]
+  
+  ibs_dist <- merged_cluster %>%
+    group_by(cluster) %>%
+    summarise(
+      n = n(),
+      across(all_of(cluster_vars_num), ~ round(mean(.x, na.rm = TRUE), 2)),
+      .groups = "drop"
+    )
+  
+  ibs_dist_long <- ibs_dist %>%
+    dplyr::select(-n) %>%
+    pivot_longer(
+      cols = -cluster,
+      names_to = "Variable",
+      values_to = "Mean"
+    ) %>%
+    pivot_wider(
+      names_from = cluster,
+      values_from = Mean,
+      names_prefix = "Cluster_"
+    )
+  
+  return(list(tab1 = ibs_dist_long, tab2 = d, graph = dist_across_clusters(model)))
+}
+
+
+plot_feature_dist <- function(input_dat, model) {
+  clustered_original <- input_dat %>%
+    mutate(
+      cluster = factor(model$clusters),
+      IBS_type = factor(
+        IBS_type,
+        levels = c(1, 2, 3),
+        labels = c("IBS-C", "IBS-D", "IBS-M")
+      )
+    )
+
+  rel_vars <- model$rel_vars
+
+  rel_vars_num <- intersect(
+    rel_vars,
+    names(clustered_original)[sapply(clustered_original, is.numeric)]
+  )
+
+  for (var in rel_vars_num) {
+
+    plot_data <- clustered_original %>%
+      dplyr::select(cluster, IBS_type, all_of(var)) %>%
+      rename(value = all_of(var))
+
+    p <- ggplot(
+      plot_data,
+      aes(
+        x = value,
+        color = cluster,
+        fill = cluster
+      )
+    ) +
+      geom_density(alpha = 0.25) +
+      facet_wrap(~ IBS_type) +
+      labs(
+        title = paste(
+          "Distribution of", var,
+          "Across Clusters Within Each IBS Type"
+        ),
+        x = paste(var, "(Original Scale)"),
+        y = "Density",
+        color = "Cluster",
+        fill = "Cluster"
+      ) +
+      theme_minimal()
+
+    print(p)
+  }
 }
 ```
 
 ```{r}
-run_lcm(wide_scaled, "wide_assign")
+model.w <- run_lcm(wide_scaled, "wide_assign")
 ```
 
 ```{r}
-merged_model <- run_lcm(merge_scaled, "wide_assign + ema")
+dist_across_clusters(model.w)
+res.w <- ibs_types_dist(input_wide, model.w)
+res.w$tab1
+table(res.w$tab2)
+res.w$graph
 ```
+
 ```{r}
-merged_cluster <- input_merged %>%
-  mutate(
-    cluster = factor(merged_model@partitions@zMAP),
-    IBS_type = factor(
-      IBS_type,
-      levels = c(1, 2, 3),
-      labels = c("IBS-C", "IBS-D", "IBS-M")
-    )
-  )
-
-table(merged_cluster$cluster, merged_cluster$IBS_type)
+plot_feature_dist(input_wide, model.w)
 ```
+
+
 ```{r}
-cluster_vars_num <- merged_model@model@names.relevant[
-  sapply(merged_cluster[merged_model@model@names.relevant], is.numeric)
-]
-
-ibs_dist <- merged_cluster %>%
-  group_by(cluster) %>%
-  summarise(
-    n = n(),
-    across(all_of(cluster_vars_num), ~ round(mean(.x, na.rm = TRUE), 2)),
-    .groups = "drop"
-  )
-
-ibs_dist_long <- ibs_dist %>%
-  select(-n) %>%
-  pivot_longer(
-    cols = -cluster,
-    names_to = "Variable",
-    values_to = "Mean"
-  ) %>%
-  pivot_wider(
-    names_from = cluster,
-    values_from = Mean,
-    names_prefix = "Cluster_"
-  )
-
-ibs_dist_long
+model.m <- run_lcm(merge_scaled, "wide_assign + ema")
 ```
+
+```{r}
+res <- ibs_types_dist(input_merged, model.m)
+table(res$tab2)
+res$tab1
+res$graph
+```
+
+
+```{r}
+plot_feature_dist(input_merged, model.m)
+```
+
 
 
