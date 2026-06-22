@@ -1,0 +1,170 @@
+```{r}
+# ############################################################################
+#  SLIDES 8 / 9 / 10 — variable-combination experiments (LPA)
+#  Runs each combination, prints K, sizes, BIC pattern, and ARI vs Rome IV.
+#  Combinations:
+#    Slide 8  : Wide + EMA + GI    (= our Experiment D; LPA version)
+#    Slide 9  : Wide + EOD + GI
+#    Slide 10 : Wide + EOD
+#  (bonus)    : Wide + EOD + EMA   (= our Experiment B)
+#
+#  EOD = the 20 PANAS daily-diary adjectives, columns end in "_diary".
+#  GI  = 4 episode distress items.
+# ############################################################################
+
+pkgs <- c("dplyr","mclust")
+for (p in pkgs) if (!requireNamespace(p, quietly=TRUE))
+  install.packages(p, repos="https://cloud.r-project.org")
+library(dplyr); library(mclust)
+
+base_path <- "/Users/seobeomjin/Desktop/SURA IBS Clustering/"
+wide    <- read.csv(paste0(base_path, "wide_assign.csv"))
+ema     <- read.csv(paste0(base_path, "EMA_B1_SURA.csv"))
+eod     <- read.csv(paste0(base_path, "EOD_B1_SURA.csv"))
+episode <- read.csv(paste0(base_path, "episode_B1_SURA.csv"))
+
+# ---------------------------------------------------------------------------
+#  Build per-patient feature blocks (one row per PID each)
+# ---------------------------------------------------------------------------
+
+# (1) WIDE: 3 baseline scales
+wide_block <- wide %>% select(PID, BSI_Total_T1, SSS_Sum_T1_Recode, VSI_Sum_T1)
+
+# (2) EMA: mean + SD of 3 signals  (>=10 responses)
+ema_block <- ema %>% group_by(PID) %>% filter(n() >= 10) %>%
+  summarise(neg_mean=mean(negative_beep,na.rm=TRUE), neg_sd=sd(negative_beep,na.rm=TRUE),
+            stress_mean=mean(stress,na.rm=TRUE),     stress_sd=sd(stress,na.rm=TRUE),
+            distress_mean=mean(distress,na.rm=TRUE), distress_sd=sd(distress,na.rm=TRUE),
+            .groups="drop")
+
+# (3) EOD: the 20 PANAS daily-diary AFFECT adjectives, per-patient mean.
+#     IMPORTANT: we list the 20 explicitly. Auto-detecting "_diary" columns is
+#     unsafe because the EOD file also contains social-contact items
+#     (interact_who_diary is TEXT, interact_num/social_interact are counts,
+#     not affect) — including them produced all-NA columns and N=0.
+panas_20 <- c("lively_diary","sad_diary","happy_diary","on_edge_diary",
+              "at_ease_diary","hostile_diary","grateful_diary","full_of_pep_diary",
+              "depressed_diary","pleased_diary","nervous_diary","calm_diary",
+              "resentful_diary","lonely_diary","energetic_diary","unhappy_diary",
+              "cheerful_diary","tense_diary","relaxed_diary","angry_diary")
+
+# the diary items live in the EOD file; keep only the 20 that are actually present
+diary_cols <- panas_20[panas_20 %in% names(eod)]
+cat("EOD: using", length(diary_cols), "PANAS affect adjectives (of 20 expected)\n")
+if (length(diary_cols) < 15)
+  stop("Fewer than 15 PANAS columns found in EOD — check column names.")
+
+# coerce to numeric defensively (some may import as character), then mean
+eod_block <- eod %>% group_by(PID) %>% filter(n() >= 3) %>%
+  summarise(across(all_of(diary_cols), ~mean(suppressWarnings(as.numeric(.x)), na.rm=TRUE)),
+            .groups="drop")
+
+# (4) GI: 4 episode distress/relief items (>=3 episodes); per-patient mean.
+#     All four are numeric rating scales (verified in the dictionary):
+#     distress before / while / intensely during a BM, and relief after.
+gi_vars <- c("distress_leading_ep","distress_sitting_ep","distress_intense_ep","bm_relief")
+gi_vars <- gi_vars[gi_vars %in% names(episode)]      # keep those present
+cat("GI: using", length(gi_vars), "episode items:", paste(gi_vars, collapse=", "), "\n\n")
+gi_block <- episode %>% group_by(PID) %>% filter(n() >= 3) %>%
+  summarise(across(all_of(gi_vars), ~mean(suppressWarnings(as.numeric(.x)), na.rm=TRUE)),
+            .groups="drop")
+
+# ---------------------------------------------------------------------------
+#  DIAGNOSTIC: show the size of each feature block before combining
+# ---------------------------------------------------------------------------
+cat("\n########## BLOCK DIAGNOSTICS ##########\n")
+cat(sprintf("wide_block: %d patients, %d vars\n", nrow(wide_block), ncol(wide_block)-1))
+cat(sprintf("ema_block : %d patients, %d vars\n", nrow(ema_block),  ncol(ema_block)-1))
+cat(sprintf("eod_block : %d patients, %d vars  (%s)\n", nrow(eod_block), ncol(eod_block)-1,
+            paste(head(setdiff(names(eod_block),"PID"),3), collapse=", ")))
+cat(sprintf("gi_block  : %d patients, %d vars  (%s)\n", nrow(gi_block), ncol(gi_block)-1,
+            paste(setdiff(names(gi_block),"PID"), collapse=", ")))
+
+# how many patients survive each overlap?
+ov <- function(...) length(Reduce(intersect, list(...)))
+cat(sprintf("\nOverlap (common PIDs):\n"))
+cat(sprintf("  wide+ema+gi : %d\n", ov(wide_block$PID, ema_block$PID, gi_block$PID)))
+cat(sprintf("  wide+eod+gi : %d   <- slide 9 (was failing)\n",
+            ov(wide_block$PID, eod_block$PID, gi_block$PID)))
+cat(sprintf("  wide+eod    : %d\n", ov(wide_block$PID, eod_block$PID)))
+cat(sprintf("  wide+eod+ema: %d\n", ov(wide_block$PID, eod_block$PID, ema_block$PID)))
+
+# ---------------------------------------------------------------------------
+#  Helper: join chosen blocks, run LPA, print a clean result line
+# ---------------------------------------------------------------------------
+run_combo <- function(blocks, label) {
+  # blocks = list of data frames each keyed by PID
+  d <- Reduce(function(a,b) inner_join(a,b,by="PID"), blocks)
+  vars <- setdiff(names(d), "PID")
+
+  # --- guard: drop any column that is entirely NA (would wipe all rows) ---
+  all_na <- vars[sapply(d[, vars], function(col) all(is.na(col)))]
+  if (length(all_na) > 0) {
+    cat(sprintf("  !! dropping %d all-NA column(s): %s\n",
+                length(all_na), paste(all_na, collapse=", ")))
+    d <- d[, setdiff(names(d), all_na)]
+    vars <- setdiff(vars, all_na)
+  }
+  d <- na.omit(d)
+
+  cat(sprintf("\n=== %s ===\n", label))
+  cat(sprintf("  N = %d   variables = %d\n", nrow(d), length(vars)))
+
+  # --- safety check 1: enough patients relative to variables? ---
+  if (nrow(d) < length(vars) + 5) {
+    cat(sprintf("  !! N (%d) too small for %d variables — LPA needs N >> p.\n",
+                nrow(d), length(vars)))
+    return(invisible(NULL))
+  }
+
+  # --- safety check 2: drop zero/near-zero variance columns (break scale()) ---
+  sds <- sapply(d[, vars], sd, na.rm=TRUE)
+  bad <- names(sds)[is.na(sds) | sds < 1e-8]
+  if (length(bad) > 0) {
+    cat(sprintf("  !! dropping %d zero-variance variable(s): %s\n",
+                length(bad), paste(bad, collapse=", ")))
+    vars <- setdiff(vars, bad)
+  }
+
+  X <- scale(d[, vars])
+  # --- safety check 3: any remaining NA/NaN after scaling? ---
+  if (any(!is.finite(X))) {
+    cat("  !! non-finite values remain after scaling — cannot run LPA.\n")
+    return(invisible(NULL))
+  }
+
+  set.seed(42)
+  m <- tryCatch(Mclust(X, G=2:6), error=function(e){
+    cat("  !! mclust failed:", conditionMessage(e), "\n"); NULL })
+  if (is.null(m)) return(invisible(NULL))
+
+  bic <- sapply(2:6, function(k) round(max(m$BIC[as.character(k),], na.rm=TRUE),1))
+  mono <- all(diff(bic[which.max(bic):length(bic)]) < 0)
+  rome <- wide$IBS_type[match(d$PID, wide$PID)]
+  ari  <- adjustedRandIndex(m$classification, rome)
+
+  cat(sprintf("  K = %d   sizes: %s\n", m$G, paste(table(m$classification), collapse=" / ")))
+  cat(sprintf("  BIC (K2..K6): %s   %s\n", paste(bic, collapse=" "),
+              if (m$G==2 && mono) "[robust K=2, monotonic]" else "[check pattern]"))
+  cat(sprintf("  ARI vs Rome IV = %.3f  (near 0 = independent of bowel-habit type)\n", ari))
+  invisible(m)
+}
+
+# ---------------------------------------------------------------------------
+#  RUN THE COMBINATIONS
+# ---------------------------------------------------------------------------
+cat("############ SLIDE 8: Wide + EMA + GI ############")
+run_combo(list(wide_block, ema_block, gi_block), "Wide + EMA + GI")
+
+cat("\n\n############ SLIDE 9: Wide + EOD + GI ############")
+run_combo(list(wide_block, eod_block, gi_block), "Wide + EOD + GI")
+
+cat("\n\n############ SLIDE 10: Wide + EOD ############")
+run_combo(list(wide_block, eod_block), "Wide + EOD")
+
+cat("\n\n############ BONUS: Wide + EOD + EMA (Experiment B) ############")
+run_combo(list(wide_block, eod_block, ema_block), "Wide + EOD + EMA")
+
+cat("\n\nDONE. Record N, K, sizes, BIC pattern, and ARI for each slide.\n")
+```
+
