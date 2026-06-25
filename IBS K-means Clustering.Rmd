@@ -1,0 +1,125 @@
+---
+title: "IBS K-means Clustering"
+output:
+  pdf_document: default
+  html_document: default
+date: "2026-06-01"
+---
+
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+library(factoextra)
+library(cluster)
+library(tidyverse)
+library(fpc)
+
+df <- read.csv("~/Desktop/clustering-SURA Project/wide_assign.csv")
+```
+
+
+```{r}
+cluster_vars <- c(
+  "BSI_Total_T1",
+  "FFMQ_Total_T1",
+  "QOL_Average_T1",
+  "PSS_Sum_T1",
+  "PHQ_Qualtrics_T1",
+  "VSI_Sum_T1",
+  "DTS_Total_T1",
+  "SSS_Sum_T1_Recode",
+  "UCLA_Total_T1"
+)
+
+cluster_data <- df[, cluster_vars]
+complete_idx <- complete.cases(cluster_data)
+cluster_data <- cluster_data[complete_idx, ]
+df_clean <- df[complete_idx, ]
+
+scaled_data <- scale(cluster_data)
+```
+
+
+```{r}
+set.seed(123)
+
+fviz_nbclust(
+  scaled_data,
+  kmeans,
+  method = "silhouette",
+  k.max = 10
+)
+
+```
+
+```{r}
+set.seed(123)
+
+km2 <- kmeans(scaled_data, centers = 2)
+
+df_clean$cluster_kmeans <- factor(km2$cluster)
+
+cluster_profile <- df_clean %>%
+  group_by(cluster_kmeans) %>%
+  summarise(
+    across(all_of(cluster_vars), ~ mean(.x, na.rm = TRUE)),
+    n = n(),
+    .groups = "drop"
+  )
+
+cluster_profile
+```
+
+
+```{r}
+fviz_cluster(
+  list(data = scaled_data, cluster = km2$cluster),
+  geom = "point",
+  ellipse = FALSE,
+  main = "K-means Clustering"
+)
+```
+
+```{r}
+set.seed(123)
+
+boot_km2 <- clusterboot(
+  scaled_data,
+  B = 100,
+  bootmethod = "boot",
+  clustermethod = kmeansCBI,
+  krange = 2,
+  seed = 150,
+  count = FALSE
+)
+
+boot_km2$bootmean
+
+boot_stability <- data.frame(
+  Cluster = 1:2,
+  Jaccard_mean = boot_km2$bootmean
+)
+
+boot_stability
+```
+
+```{r}
+ibs_dist <-
+  df_clean %>%
+  group_by(cluster_kmeans, IBS_type) %>%
+  summarise(
+    across(
+      all_of(cluster_vars),
+      ~ round(mean(.x, na.rm = TRUE), 2)
+    ),
+    n = n(),
+    .groups = "drop"
+  )
+
+ibs_dist
+```
+
