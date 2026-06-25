@@ -32,7 +32,9 @@ library(clusterSim)
 ```{r}
 ema_0 <- read.csv("../EMA_B1_SURA.csv")
 wide_assign <- read.csv("../wide_assign.csv")
+episode_0 <- read.csv("../episode.csv")
 ```
+
 
 ```{r data_cleaning}
 cat_vars <- c("Gender_Final", "Substance_use", "Stress_tech",
@@ -84,7 +86,113 @@ merge_scaled <- input_merged
 merge_scaled[num_vars.merged] <- scale(input_merged[num_vars.merged])
 ```
 
+
+```{r data_cleaning.ep}
+episode_cat_vars <- c("current_symp_ep", "bm_location_ep", 
+                      "bm_type_ep", "bm_type_cat", "bm_location_home")
+
+convert_time <- function(x, feat) {
+  if (feat == "length_toilet_ep") {
+    case_when(
+      x == "1–3 minutes" ~ 1,
+      x == "3–5 minutes" ~ 2,
+      x == "5–15 minutes" ~ 3,
+      x == "15–30 minutes" ~ 4,
+      x == "More than 30 minutes" ~ 5,
+      TRUE ~ NA_real_
+    )
+  }
+  
+  else if (feat == "recent_meal") {
+    case_when(
+      x == "0–10 minutes ago" ~ 1,
+      x == "10–30 minutes ago" ~ 2,
+      x == "30–60 minutes ago" ~ 3,
+      x == "More than 60 minutes ago" ~ 4,
+      TRUE ~ NA_real_
+    )
+  }
+}
+
+time_vars <- c("length_toilet_ep", "recent_meal")
+episode <- episode_0 %>% 
+  na.omit() %>%
+  group_by(PID) %>%
+  filter(n() >= 2) %>% 
+  ungroup() %>%
+  dplyr::select(-day, -time, -Weekday_Weekend, -timeofday_new) %>%
+  mutate(
+    across(all_of(episode_cat_vars), factor)
+  )
+
+episode <- episode %>%
+  mutate(
+    across(
+      all_of(time_vars),
+      ~ convert_time(.x, cur_column())
+    )
+  )
+
+avg_episode <- episode %>%
+  na.omit() %>%
+  group_by(PID) %>% 
+  summarize(
+    across(where(is.numeric), list(
+      mean = ~mean(.x, na.rm = TRUE),
+      sd   = ~sd(.x, na.rm = TRUE)
+    ), .names = "{.col}_{.fn}"),
+    
+    across(where(is.factor), ~first(.x)),
+    .groups = "drop"
+  )
+
+merged_data_episode <- merged_data %>% 
+  inner_join(avg_episode, by = "PID")
+
+input_merged_episode <- merged_data_episode %>%
+  dplyr::select(-PID)
+
+num_vars.episode <- setdiff(names(input_merged_episode), c(cat_vars, episode_cat_vars))
+
+merge_episode_scaled <- input_merged_episode
+
+merge_episode_scaled[num_vars.episode] <- scale(
+  input_merged_episode[num_vars.episode]
+)
+
+merge_episode_scaled <- merge_episode_scaled %>%
+  mutate(
+    across(where(is.factor), droplevels)
+  )
+```
+
+```{r data_info}
+cleaning_summary <- tibble(
+  Dataset = c(
+    "Original Dataset",
+    "After wide cleaning",
+    "Wide + EMA dataset", 
+    "Wide + EMA + EP dataset"
+  ),
+  n_obs = c(
+    n_distinct(wide_assign$PID),
+    n_distinct(wide_assign.cleaned$PID),
+    n_distinct(merged_data$PID), 
+    n_distinct(merged_data_episode$PID)
+  )
+)
+
+kable(
+  cleaning_summary,
+  caption = "Number of observations pre and post data cleaning"
+)
+```
+
 ```{r helper_functions}
+# runs the model and produces a heatmap for each cluster 
+# based on the phenotypes indicated by relevant/important features
+# input: data and name for heatmap
+# output: the result of running varselcluster, relevant features, cluster labels
 run_lcm <- function(data, name) {
   model <- VarSelCluster(x = data, gvals = 1:6)
   
@@ -112,7 +220,7 @@ run_lcm <- function(data, name) {
   pheatmap(t(mat), 
            cluster_rows = TRUE, 
            cluster_cols = TRUE, 
-           main = paste("IBS Phynotype for Normalized", name, "data"))
+           main = paste("IBS Phenotype for Normalized", name, "data"))
   
   return (list(
     model = model,
@@ -123,6 +231,7 @@ run_lcm <- function(data, name) {
   ))
 }
 
+# creates the bar graphs for proportion of each IBS type in each cluster
 dist_across_clusters <- function(model) {
   clustered_data <- model$clustered_data
   ibs_dist <- clustered_data %>%
@@ -155,6 +264,12 @@ dist_across_clusters <- function(model) {
     theme_minimal()
 }
 
+
+# all visualization aid
+# input: the data we are clustering on and the results from run_lcm
+# output: tab1: zscore for relevant variables in each cluster
+#         tab2: table listing number of patients belonging to each IBS type
+#         tab3: bar graph from dist_across_clusters
 ibs_types_dist <- function(input_dat, model) {
   merged_cluster <- input_dat %>%
     mutate(
@@ -165,7 +280,14 @@ ibs_types_dist <- function(input_dat, model) {
         labels = c("IBS-C", "IBS-D", "IBS-M")
       )
     )
-  d <- list(merged_cluster$cluster, merged_cluster$IBS_type)
+  d <- table(merged_cluster$cluster, merged_cluster$IBS_type)
+
+  d <- as.data.frame.matrix(d)
+  
+  d$total <- rowSums(d)
+  d$cluster <- rownames(d)
+  
+  d <- d[, c("cluster", "IBS-C", "IBS-D", "IBS-M", "total")]
   
     cluster_vars_num <- model$rel_vars[
       sapply(merged_cluster[model$rel_vars], is.numeric)
@@ -195,7 +317,8 @@ ibs_types_dist <- function(input_dat, model) {
   return(list(tab1 = ibs_dist_long, tab2 = d, graph = dist_across_clusters(model)))
 }
 
-
+# plot the distribution of each relevant feature 
+# split by type of IBS patient has 
 plot_feature_dist <- function(input_dat, model) {
   clustered_original <- input_dat %>%
     mutate(
@@ -252,12 +375,17 @@ model.w <- run_lcm(wide_scaled, "wide_assign")
 ```
 
 ```{r}
-dist_across_clusters(model.w)
 res.w <- ibs_types_dist(input_wide, model.w)
 res.w$tab1
-table(res.w$tab2)
+kable(res.w$tab2)
 res.w$graph
 ```
+```{r}
+# returns a bar graph of how much discriminative power each variable has
+# discrimitive power: essentially how much it separates each cluster
+plot(model.w$model)
+```
+
 
 ```{r}
 plot_feature_dist(input_wide, model.w)
@@ -270,15 +398,37 @@ model.m <- run_lcm(merge_scaled, "wide_assign + ema")
 
 ```{r}
 res <- ibs_types_dist(input_merged, model.m)
-table(res$tab2)
+kable(res$tab2)
 res$tab1
 res$graph
 ```
+
+```{r}
+plot(model.m$model)
+```
+
 
 
 ```{r}
 plot_feature_dist(input_merged, model.m)
 ```
 
+```{r}
+model.ep <- run_lcm(merge_episode_scaled, "wide_assign + ema + episode")
+```
 
+```{r}
+res.ep <- ibs_types_dist(merged_data_episode, model.ep)
+kable(res.ep$tab2)
+res.ep$tab1
+res.ep$graph
+```
+
+```{r}
+plot(model.ep$model)
+```
+
+```{r}
+plot_feature_dist(merged_data_episode, model.ep)
+```
 
